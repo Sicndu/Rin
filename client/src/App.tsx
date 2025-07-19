@@ -70,7 +70,7 @@ function App() {
         <ProfileContext.Provider value={profile}>
           <Helmet>
             {favicon &&
-              <link rel="icon" href={favicon} />}
+              <link rel="icon" href='https://img.icons8.com/?size=100&id=17375&format=png&color=000000' />}
           </Helmet>
           <Switch>
             <RouteMe path="/">
