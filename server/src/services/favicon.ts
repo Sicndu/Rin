@@ -4,6 +4,8 @@ import { getEnv } from "../utils/di";
 import { setup } from "../setup";
 import { createS3Client } from "../utils/s3";
 import path from "path";
+import crypto from "crypto";
+import type { Context } from "elysia";
 
 // @see https://developers.cloudflare.com/images/url-format#supported-formats-and-limitations
 export const FAVICON_ALLOWED_TYPES: { [key: string]: string } = {
@@ -17,6 +19,16 @@ export function getFaviconKey() {
     return path.join(env.S3_FOLDER || "", "favicon.webp");
 }
 
+// 生成基于时间的版本号，用于缓存破坏
+export function generateVersionTimestamp(): string {
+    return Date.now().toString();
+}
+
+// 生成文件的ETag
+export function generateETag(buffer: Buffer): string {
+    return crypto.createHash("sha1").update(buffer).digest("hex");
+}
+
 export function FaviconService() {
     const env = getEnv();
     const s3 = createS3Client();
@@ -25,7 +37,7 @@ export function FaviconService() {
     const faviconKey = getFaviconKey();
     return new Elysia({ aot: false })
         .use(setup())
-        .get("/favicon", async ({ set }) => {
+        .get("/favicon", async ({ set, request }) => {
             try {
                 const response = await fetch(
                     new Request(`${accessHost}/${faviconKey}`),
@@ -36,10 +48,22 @@ export function FaviconService() {
                     return await response.text();
                 }
 
-                set.headers["Content-Type"] = "image/webp";
-                set.headers["Cache-Control"] = "public, max-age=31536000"; // 1 year
+                const arrayBuffer = await response.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+                const etag = generateETag(buffer);
 
-                return await response.arrayBuffer();
+                // 检查If-None-Match头以实现协商缓存
+                const ifNoneMatch = request.headers.get("If-None-Match");
+                if (ifNoneMatch === etag) {
+                    set.status = 304; // Not Modified
+                    return null;
+                }
+
+                set.headers["Content-Type"] = "image/webp";
+                set.headers["Cache-Control"] = "public, max-age=0, must-revalidate, stale-while-revalidate=604800";
+                set.headers["ETag"] = etag;
+
+                return arrayBuffer;
             } catch (error) {
                 if (error instanceof Error) {
                     set.status = 500;
@@ -48,7 +72,7 @@ export function FaviconService() {
                 }
             }
         })
-        .get("/favicon/original", async ({ set }) => {
+                    .get("/favicon/original", async ({ set, request }) => {
             try {
                 let originFaviconKey = null;
                 for (const [mimeType, ext] of Object.entries(
@@ -63,11 +87,22 @@ export function FaviconService() {
                     );
 
                     if (response.ok) {
-                        set.headers["Content-Type"] = mimeType;
-                        set.headers["Cache-Control"] =
-                            "public, max-age=31536000"; // 1 year
+                        const arrayBuffer = await response.arrayBuffer();
+                        const buffer = Buffer.from(arrayBuffer);
+                        const etag = generateETag(buffer);
 
-                        return await response.arrayBuffer();
+                        // 检查If-None-Match头以实现协商缓存
+                        const ifNoneMatch = request.headers.get("If-None-Match");
+                        if (ifNoneMatch === etag) {
+                            set.status = 304; // Not Modified
+                            return null;
+                        }
+
+                        set.headers["Content-Type"] = mimeType;
+                        set.headers["Cache-Control"] = "public, max-age=0, must-revalidate, stale-while-revalidate=604800";
+                        set.headers["ETag"] = etag;
+
+                        return arrayBuffer;
                     }
                 }
 
@@ -83,7 +118,12 @@ export function FaviconService() {
         })
         .post(
             "/favicon",
-            async ({ request, set, body: { file }, admin }) => {
+            async ({ request, set, body: { file }, admin }: {
+                request: Request;
+                set: Context["set"];
+                body: { file: File };
+                admin: boolean;
+            }) => {
                 try {
                     if (!admin) {
                         set.status = 403;
@@ -146,11 +186,19 @@ export function FaviconService() {
                             Bucket: bucket,
                             Key: faviconKey,
                             Body: buffer,
+                            // 设置S3对象的元数据，包括ETag和缓存控制
+                            Metadata: {
+                                "Cache-Control": "public, max-age=0, must-revalidate, stale-while-revalidate=604800"
+                            }
                         }),
                     );
 
+                    // 生成版本时间戳用于前端缓存破坏
+                    const versionTimestamp = generateVersionTimestamp();
+
                     return {
-                        url: `${accessHost}/${faviconKey}`,
+                        url: `${accessHost}/${faviconKey}?v=${versionTimestamp}`,
+                        timestamp: versionTimestamp
                     };
                 } catch (error) {
                     if (error instanceof Error) {
